@@ -16,6 +16,9 @@ from pathlib import Path
 import numpy as np
 import sentencepiece as spm
 import torch
+
+if os.environ.get("WANDB_ENABLED", "0") == "1":
+    import wandb
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -47,19 +50,20 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_start_step = int(os.environ.get("WARMDOWN_START_STEP", 1000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 1024*24))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    num_layers = int(os.environ.get("NUM_LAYERS", 4))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 2))
+    model_dim = int(os.environ.get("MODEL_DIM", 256))
+    num_heads = int(os.environ.get("NUM_HEADS", 4))
+    mlp_mult = int(os.environ.get("MLP_MULT", 1))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -888,6 +892,9 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    if master_process and os.environ.get("WANDB_ENABLED", "0") == "1":
+        wandb.init(project=os.environ.get("WANDB_PROJECT", "expbase"), config=vars(args))
+        wandb.log({"model_params": n_params}, step=0)
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -918,8 +925,8 @@ def main() -> None:
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
             return 1.0
+        warmdown_start = args.warmdown_start_step
         if max_wallclock_ms is None:
-            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
             return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
@@ -987,6 +994,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if master_process and os.environ.get("WANDB_ENABLED", "0") == "1":
+                wandb.log({"val_loss": val_loss, "val_bpb": val_bpb, "lr": scale}, step=step)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1038,6 +1047,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if master_process and os.environ.get("WANDB_ENABLED", "0") == "1":
+                wandb.log({"train_loss": train_loss.item(), "lr": scale}, step=step)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1112,6 +1123,8 @@ def main() -> None:
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
+    if master_process and os.environ.get("WANDB_ENABLED", "0") == "1":
+        wandb.finish()
     if distributed:
         dist.destroy_process_group()
 

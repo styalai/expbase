@@ -20,6 +20,9 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
 
+if os.environ.get("WANDB_ENABLED", "0") == "1":
+    import wandb
+
 # ==============================================================================
 # SHARD FORMAT + COMPUTE DTYPE
 # ==============================================================================
@@ -42,12 +45,12 @@ class Hyperparameters:
     seed: int = int(os.environ.get("SEED", 1337))
 
     # Training loop. These defaults now mirror train_gpt.py on a single process.
-    iterations: int = int(os.environ.get("ITERATIONS", 20_000))
+    iterations: int = int(os.environ.get("ITERATIONS", 1000))
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
     # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
-    train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+    train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 25))
+    train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 1024*24))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
     train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024)))
     # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
@@ -59,15 +62,16 @@ class Hyperparameters:
     mlx_eager_eval: bool = bool(int(os.environ.get("MLX_EAGER_EVAL", "1")))
     warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_start_step: int = int(os.environ.get("WARMDOWN_START_STEP", 1000))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
-    model_dim: int = int(os.environ.get("MODEL_DIM", 512))
-    num_heads: int = int(os.environ.get("NUM_HEADS", 8))
-    num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
-    mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    num_layers: int = int(os.environ.get("NUM_LAYERS", 4))
+    model_dim: int = int(os.environ.get("MODEL_DIM", 256))
+    num_heads: int = int(os.environ.get("NUM_HEADS", 4))
+    num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 2))
+    mlp_mult: int = int(os.environ.get("MLP_MULT", 1))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
@@ -105,8 +109,8 @@ class Hyperparameters:
     def lr_mul(self, step: int, elapsed_ms: float) -> float:
         if self.warmdown_iters <= 0:
             return 1.0
+        warmdown_start = self.warmdown_start_step
         if self.max_wallclock_seconds <= 0:
-            warmdown_start = max(self.iterations - self.warmdown_iters, 0)
             return max((self.iterations - step) / max(self.warmdown_iters, 1), 0.0) if warmdown_start <= step < self.iterations else 1.0
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = self.warmdown_iters * step_ms
@@ -911,6 +915,9 @@ def main() -> None:
     # Print config once so logs are self-describing.
     n_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
     log(f"run_id:{args.run_id}")
+    if os.environ.get("WANDB_ENABLED", "0") == "1":
+        wandb.init(project=os.environ.get("WANDB_PROJECT", "expbase"), config=vars(args))
+        wandb.log({"model_params": n_params}, step=0)
     log(f"mlx_version:{mx.__version__}")
     log(f"train_loader:shards pattern={args.train_files}")
     log(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.size - 1}")
@@ -1013,6 +1020,8 @@ def main() -> None:
                     f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                     f"train_time:{train_time_ms:.0f}ms step_avg:{train_time_ms / max(step, 1):.2f}ms"
                 )
+                if os.environ.get("WANDB_ENABLED", "0") == "1":
+                    wandb.log({"val_loss": val_loss, "val_bpb": val_bpb, "lr": lr_mul}, step=step)
             t0 = time.perf_counter()
         if last_step:
             if stop_after_step is not None and step < args.iterations:
@@ -1047,6 +1056,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
                 f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
             )
+            if os.environ.get("WANDB_ENABLED", "0") == "1":
+                wandb.log({"train_loss": train_loss_value, "lr": lr_mul}, step=step)
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
 
@@ -1092,6 +1103,8 @@ def main() -> None:
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if os.environ.get("WANDB_ENABLED", "0") == "1":
+        wandb.finish()
 
 
 if __name__ == "__main__":
