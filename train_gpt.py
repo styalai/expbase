@@ -877,6 +877,7 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
+        step_t0 = time.perf_counter()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
@@ -904,6 +905,8 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+        step_ms = 1000.0 * (time.perf_counter() - step_t0)
+        tok_s = args.train_batch_tokens / (step_ms / 1000.0)
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -912,10 +915,17 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"step_ms:{step_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"tok_s:{tok_s:.0f} train_time:{approx_training_time_ms:.0f}ms"
             )
             if master_process and os.environ.get("WANDB_ENABLED", "0") == "1":
-                wandb.log({"train_loss": train_loss.item(), "lr": scale}, step=step)
+                wandb.log({
+                    "train_loss": train_loss.item(),
+                    "lr": scale,
+                    "step_ms": step_ms,
+                    "tok_s": tok_s,
+                    "step": step,
+                }, step=step)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms

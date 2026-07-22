@@ -918,10 +918,16 @@ def main() -> None:
         if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
             log(
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
-                f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
+                f"step_ms:{step_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
             )
             if os.environ.get("WANDB_ENABLED", "0") == "1":
-                wandb.log({"train_loss": train_loss_value, "lr": lr_mul}, step=step)
+                wandb.log({
+                    "train_loss": train_loss_value,
+                    "lr": lr_mul,
+                    "step_ms": step_ms,
+                    "tok_s": tok_s,
+                    "step": step,
+                }, step=step)
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
 
